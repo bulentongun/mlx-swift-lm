@@ -26,7 +26,7 @@ let package = Package(
             targets: ["MLXEmbedders"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/bulentongun/mlx-swift", .branch("ipad-shader-fix")),
+        .package(url: "https://github.com/bulentongun/mlx-swift", .branch("prism-with-ipad-fix")),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
             .upToNextMinor(from: "1.2.0")
