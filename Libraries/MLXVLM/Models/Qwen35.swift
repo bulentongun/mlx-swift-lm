@@ -1106,6 +1106,9 @@ public class Qwen35: Module, VLMModel {
         cache: [any KVCache],
         windowSize _: Int?
     ) throws -> PrepareResult {
+        // Apr 2: Reset stale position state before each inference (Issue #157 fix)
+        languageModel.resetPositionState()
+
         let inputIds = input.text.tokens
 
         var pixelValues: MLXArray?
