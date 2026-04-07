@@ -282,6 +282,12 @@ public func initializeRope(
             shortFactor: shortFactor,
             longFactor: longFactor
         )
+    } else if ropeType == "proportional" {
+        // Gemma 4 proportional RoPE — standard RoPE with optional scaling factor
+        // Partial rotation is handled in the attention layer, not here
+        let factor = scalingConfig?["factor"]?.asFloat() ?? 1.0
+        let scale = factor > 0 ? 1.0 / factor : 1.0
+        return RoPE(dimensions: dims, traditional: traditional, base: base, scale: scale)
     } else if ropeType == "mrope" {
         // MRoPE returns basic RoPE here. The actual multi-modal rotary embedding logic
         // (applying different embeddings per modality) is handled in the attention layer
