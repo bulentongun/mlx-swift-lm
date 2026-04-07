@@ -203,6 +203,96 @@ public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
 
 }
 
+// MARK: - ProportionalRoPE (Gemma 4)
+
+/// Gemma 4 ProportionalRoPE — rotates only a fraction of head dimensions.
+/// Frequencies are computed relative to the FULL head dimension (not just the rotated portion).
+/// Ported from Blaizzy/mlx-vlm/models/gemma4/rope_utils.py
+public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
+    let dims: Int
+    let rotatedDims: Int
+    let traditional: Bool
+    let base: Float
+
+    private var _freqs: MLXArray?
+
+    public init(dims: Int, traditional: Bool = false, base: Float = 10000.0, partialRotaryFactor: Float = 1.0) {
+        self.dims = dims
+        self.traditional = traditional
+        self.base = base
+
+        // Calculate how many dimensions to actually rotate
+        let ropeAngles = Int(partialRotaryFactor * Float(dims) / 2.0)
+        self.rotatedDims = 2 * ropeAngles
+
+        super.init()
+    }
+
+    private func computeFreqs() -> MLXArray {
+        // Exponents scaled by FULL dims (not rotatedDims) — this is the "proportional" part
+        let exponents = MLXArray(stride(from: Float(0), to: Float(rotatedDims), by: 2)) / Float(dims)
+        return pow(MLXArray(base), -exponents)
+    }
+
+    public func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
+        let freqs = _freqs ?? computeFreqs()
+        if _freqs == nil { _freqs = freqs }
+        return applyProportionalRoPE(x, freqs: freqs, offset: offset)
+    }
+
+    public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        let freqs = _freqs ?? computeFreqs()
+        if _freqs == nil { _freqs = freqs }
+        return applyProportionalRoPE(x, freqs: freqs, offsetArray: offset)
+    }
+
+    private func applyProportionalRoPE(_ x: MLXArray, freqs: MLXArray, offset: Int = 0, offsetArray: MLXArray? = nil) -> MLXArray {
+        // x shape: [B, nHeads, L, headDim]
+        let shape = x.shape
+        let headDim = shape[shape.count - 1]
+
+        if rotatedDims >= headDim {
+            // Full rotation — use standard RoPE
+            return MLXFast.RoPE(
+                x, dimensions: rotatedDims, traditional: traditional,
+                base: nil, scale: 1.0, offset: offset, freqs: freqs
+            )
+        }
+
+        // Partial rotation: split into rotated and passthrough parts
+        // Split at rotatedDims/2 from each half (HF rotate_half convention)
+        let halfDim = headDim / 2
+        let ropeAngles = rotatedDims / 2
+
+        // Split x into left half and right half
+        let xLeft = x[.ellipsis, ..<halfDim]
+        let xRight = x[.ellipsis, halfDim...]
+
+        // Extract the portions to rotate from each half
+        let xLeftRot = xLeft[.ellipsis, ..<ropeAngles]
+        let xLeftPass = xLeft[.ellipsis, ropeAngles...]
+        let xRightRot = xRight[.ellipsis, ..<ropeAngles]
+        let xRightPass = xRight[.ellipsis, ropeAngles...]
+
+        // Apply RoPE to rotated portions (concatenated)
+        let toRotate = concatenated([xLeftRot, xRightRot], axis: -1)
+        let rotated = MLXFast.RoPE(
+            toRotate, dimensions: rotatedDims, traditional: traditional,
+            base: nil, scale: 1.0, offset: offset, freqs: freqs
+        )
+
+        // Split rotated back
+        let rotatedLeft = rotated[.ellipsis, ..<ropeAngles]
+        let rotatedRight = rotated[.ellipsis, ropeAngles...]
+
+        // Reconstruct
+        let newLeft = concatenated([rotatedLeft, xLeftPass], axis: -1)
+        let newRight = concatenated([rotatedRight, xRightPass], axis: -1)
+
+        return concatenated([newLeft, newRight], axis: -1)
+    }
+}
+
 private let yarnTypes: Set = ["yarn", "deepseek_yarn", "telechat3-yarn"]
 
 public typealias RoPELayer = OffsetLayer & ArrayOffsetLayer
@@ -283,11 +373,14 @@ public func initializeRope(
             longFactor: longFactor
         )
     } else if ropeType == "proportional" {
-        // Gemma 4 proportional RoPE — standard RoPE with optional scaling factor
-        // Partial rotation is handled in the attention layer, not here
-        let factor = scalingConfig?["factor"]?.asFloat() ?? 1.0
-        let scale = factor > 0 ? 1.0 / factor : 1.0
-        return RoPE(dimensions: dims, traditional: traditional, base: base, scale: scale)
+        // Gemma 4 ProportionalRoPE — partial rotation with frequencies scaled by full dim
+        let partialFactor = scalingConfig?["partial_rotary_factor"]?.asFloat() ?? 1.0
+        return ProportionalRoPE(
+            dims: dims,
+            traditional: traditional,
+            base: base,
+            partialRotaryFactor: partialFactor
+        )
     } else if ropeType == "mrope" {
         // MRoPE returns basic RoPE here. The actual multi-modal rotary embedding logic
         // (applying different embeddings per modality) is handled in the attention layer

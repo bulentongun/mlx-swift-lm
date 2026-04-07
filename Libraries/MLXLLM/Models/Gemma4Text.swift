@@ -488,8 +488,8 @@ class Gemma4DecoderLayer: Module {
     @ModuleInfo(key: "per_layer_projection") var perLayerProjection: Linear?
     @ModuleInfo(key: "post_per_layer_input_norm") var postPerLayerInputNorm: Gemma.RMSNorm?
 
-    // Layer scalar
-    let layerScalar: MLXArray
+    // Layer scalar (loaded from weights)
+    @ParameterInfo(key: "layer_scalar") var layerScalar: MLXArray
 
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         self.config = config
@@ -532,8 +532,8 @@ class Gemma4DecoderLayer: Module {
             self._postPerLayerInputNorm.wrappedValue = Gemma.RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
         }
 
-        // Layer scalar
-        self.layerScalar = MLXArray.ones([1])
+        // Layer scalar (will be loaded from weights, default ones)
+        self._layerScalar.wrappedValue = MLXArray.ones([1])
 
         super.init()
     }
@@ -737,8 +737,10 @@ public class Gemma4Model: Module {
         }
 
         // PLE: compute per-layer inputs
+        // PLE restored after diagnosis — garbage was caused by wrong chat template, not PLE
+        let pleEnabled = hasPLE
         var resolvedPLI = perLayerInputs
-        if hasPLE {
+        if pleEnabled {
             if perLayerInputs == nil {
                 resolvedPLI = getPerLayerInputs(inputs)
             }
