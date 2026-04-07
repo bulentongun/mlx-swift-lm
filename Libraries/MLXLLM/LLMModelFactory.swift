@@ -21,8 +21,8 @@ private func create<C: Codable, M>(
 /// Typically called via ``LLMModelFactory/load(hub:configuration:progressHandler:)``.
 public enum LLMTypeRegistry {
 
-    /// Shared instance with default model types.
-    public static let shared: ModelTypeRegistry = .init(creators: [
+    // Helper dictionaries split to avoid Swift type-checker timeout on large literals
+    private static let creatorsPartA: [String: (Data) throws -> any LanguageModel] = [
         "mistral": create(LlamaConfiguration.self, LlamaModel.init),
         "llama": create(LlamaConfiguration.self, LlamaModel.init),
         "phi": create(PhiConfiguration.self, PhiModel.init),
@@ -47,6 +47,9 @@ public enum LLMTypeRegistry {
         "openelm": create(OpenElmConfiguration.self, OpenELMModel.init),
         "internlm2": create(InternLM2Configuration.self, InternLM2Model.init),
         "deepseek_v3": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
+    ]
+
+    private static let creatorsPartB: [String: (Data) throws -> any LanguageModel] = [
         "granite": create(GraniteConfiguration.self, GraniteModel.init),
         "granitemoehybrid": create(
             GraniteMoeHybridConfiguration.self, GraniteMoeHybridModel.init),
@@ -77,7 +80,12 @@ public enum LLMTypeRegistry {
         "jamba_3b": create(JambaConfiguration.self, JambaModel.init),
         "mistral3": create(Mistral3TextConfiguration.self, Mistral3TextModel.init),
         "apertus": create(ApertusConfiguration.self, ApertusModel.init),
-    ])
+    ]
+
+    /// Shared instance with default model types.
+    public static let shared: ModelTypeRegistry = .init(
+        creators: creatorsPartA.merging(creatorsPartB) { _, new in new }
+    )
 }
 
 /// Registry of models and any overrides that go with them, e.g. prompt augmentation.
