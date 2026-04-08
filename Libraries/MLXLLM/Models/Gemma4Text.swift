@@ -501,14 +501,19 @@ public class Gemma4Model: Module {
         guard let embed = embedTokensPerLayer else { fatalError("PLE not init") }
         var result = embed(inputIds)
         result = result * pleEmbedScale
-        return result.reshaped(inputIds.dim(0), inputIds.dim(1), config.hiddenLayers, config.hiddenSizePerLayerInput)
+        // Shape-agnostic reshape: keep every existing axis of inputIds and append (num_layers, hidden_per_layer).
+        // Matches Gemma3nText pattern. Previous implementation hard-coded (dim0, dim1) which
+        // breaks when the iterator feeds a 1-D or higher-rank token tensor.
+        return result.reshaped(Array(inputIds.shape) + [config.hiddenLayers, config.hiddenSizePerLayerInput])
     }
 
     private func projectPerLayerInputs(_ h: MLXArray, _ perLayerInputs: MLXArray?) -> MLXArray {
         guard let proj = perLayerModelProjection, let normLayer = perLayerProjectionNorm else { fatalError("PLE not init") }
         var plp = proj(h)
         plp = plp * perLayerProjectionScale
-        plp = plp.reshaped(h.dim(0), h.dim(1), config.hiddenLayers, config.hiddenSizePerLayerInput)
+        // Preserve every leading axis of h except the last (which holds the projected per-layer
+        // slab) and append (num_layers, hidden_per_layer). Matches Gemma3nText.
+        plp = plp.reshaped(Array(h.shape.dropLast()) + [config.hiddenLayers, config.hiddenSizePerLayerInput])
         plp = normLayer(plp)
         guard let pli = perLayerInputs else { return plp }
         return (plp + pli) * pleScale
