@@ -334,7 +334,11 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
 /// Converts pixel tensor [B, C, H, W] into patch tokens via reshape + per-channel normalization
 /// into [-1, 1] + linear projection, then adds learned 2D position embeddings via one-hot lookup.
 private class Gemma4VisionPatchEmbedder: Module {
-    @ModuleInfo(key: "input_proj") var inputProj: Gemma4ClippableLinear
+    // Note: patch_embedder.input_proj in the checkpoint is a *plain* Linear with the
+    // weight stored at `vision_tower.patch_embedder.input_proj.weight` (NOT
+    // `...input_proj.linear.weight`). The encoder layers use ClippableLinear with
+    // an extra `linear.` namespace level, but this first projection does not.
+    @ModuleInfo(key: "input_proj") var inputProj: Linear
     @ParameterInfo(key: "position_embedding_table") var positionEmbeddingTable: MLXArray
 
     let patchSize: Int
@@ -350,9 +354,7 @@ private class Gemma4VisionPatchEmbedder: Module {
         self.positionEmbeddingSize = pes
 
         let patchFeatureDim = 3 * p * p
-        self._inputProj.wrappedValue = Gemma4ClippableLinear(
-            patchFeatureDim, h,
-            bias: false, useClipping: config.effectiveUseClippedLinears)
+        self._inputProj.wrappedValue = Linear(patchFeatureDim, h, bias: false)
 
         // Position embedding table: [2, position_embedding_size, hidden_size]
         // One row per spatial axis; patch (row, col) gets embeddings from row 0 at col index
