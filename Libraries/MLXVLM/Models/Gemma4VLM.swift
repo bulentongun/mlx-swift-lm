@@ -737,33 +737,45 @@ public class Gemma4VLMModel: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        // Text-only fast path: no image => delegate to language model directly.
-        guard let pixels = input.image?.pixels else {
-            guard input.text.tokens.shape[0] > 0 else {
-                return .tokens(.init(tokens: MLXArray(Int32(0))[0 ..< 0]))
-            }
-            return .tokens(input.text)
-        }
-
-        // Multimodal path: compute embeddings + PLE, then call language model directly.
+        // Consume the full prompt in one forward pass and return next-token logits.
+        // Matches the Qwen35 pattern — returning .tokens(input.text) would send the
+        // iterator down a per-token loop that interacts badly with PLE reshape when
+        // the tensor rank changes mid-stream.
         let inputIds = input.text.tokens
-        let inputsEmbeds = getInputEmbeddings(inputIds: inputIds, pixelValues: pixels)
-        let pleIds = buildPLETokenIds(inputIds)
+        guard inputIds.shape[0] > 0 else {
+            // Empty batch — unusual, but handle gracefully.
+            let empty = MLXArray(Int32(0))[0 ..< 0]
+            return .tokens(.init(tokens: empty))
+        }
 
         let kvCache: [KVCache] = cache.compactMap { $0 as? KVCache }
 
-        let logits = languageModel.callWithEmbeddings(
-            inputIds: pleIds,
-            inputEmbeddings: inputsEmbeds,
-            perLayerInputs: nil,  // Language model computes PLE internally from pleIds
-            cache: kvCache
-        )
+        let logits: MLXArray
+        if let pixels = input.image?.pixels {
+            // Multimodal path: fuse image features into text embeddings, then
+            // dispatch via callWithEmbeddings so the text decoder runs its
+            // callAsFunction(inputs:cache:inputEmbeddings:perLayerInputs:) variant.
+            let inputsEmbeds = getInputEmbeddings(inputIds: inputIds, pixelValues: pixels)
+            let pleIds = buildPLETokenIds(inputIds)
+            logits = languageModel.callWithEmbeddings(
+                inputIds: pleIds,
+                inputEmbeddings: inputsEmbeds,
+                perLayerInputs: nil,   // language_model computes PLE internally from pleIds
+                cache: kvCache
+            )
+        } else {
+            // Text-only path: full prompt ingest in one call. Do NOT return .tokens(...)
+            // because that sends the TokenIterator into a per-token loop that produced
+            // a 'size 0' reshape crash inside PLE during the decode tail.
+            logits = languageModel(inputIds, cache: kvCache)
+        }
 
         return .logits(.init(logits: logits))
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        // Text-only per-token step during generation.
+        // Per-token decode step during generation. The iterator calls this once per
+        // output token with a single-token input tensor; PLE is recomputed from inputs.
         return languageModel(inputs, cache: cache)
     }
 
