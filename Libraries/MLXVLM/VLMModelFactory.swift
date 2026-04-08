@@ -81,56 +81,53 @@ private func create<C: Codable, P>(
 public enum VLMTypeRegistry {
 
     /// Shared instance with default model types.
-    public static let shared: ModelTypeRegistry = .init(creators: [
-        "paligemma": create(PaliGemmaConfiguration.self, PaliGemma.init),
-        "qwen2_vl": create(Qwen2VLConfiguration.self, Qwen2VL.init),
-        "qwen2_5_vl": create(Qwen25VLConfiguration.self, Qwen25VL.init),
-        "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
-        "qwen3_5": create(Qwen35Configuration.self, Qwen35.init),
-        "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
-        "idefics3": create(Idefics3Configuration.self, Idefics3.init),
-        "gemma3": create(Gemma3Configuration.self, Gemma3.init),
-        "smolvlm": create(SmolVLM2Configuration.self, SmolVLM2.init),
+    /// 8 Apr 2026: builder pattern used instead of dictionary literal to keep the Swift
+    /// type-checker happy when adding Gemma 4 (literal hit a type-checker timeout).
+    public static let shared: ModelTypeRegistry = {
+        var creators: [String: (Data) throws -> any LanguageModel] = [:]
+        creators["paligemma"] = create(PaliGemmaConfiguration.self, PaliGemma.init)
+        creators["qwen2_vl"] = create(Qwen2VLConfiguration.self, Qwen2VL.init)
+        creators["qwen2_5_vl"] = create(Qwen25VLConfiguration.self, Qwen25VL.init)
+        creators["qwen3_vl"] = create(Qwen3VLConfiguration.self, Qwen3VL.init)
+        creators["qwen3_5"] = create(Qwen35Configuration.self, Qwen35.init)
+        creators["qwen3_5_moe"] = create(Qwen35Configuration.self, Qwen35MoE.init)
+        creators["idefics3"] = create(Idefics3Configuration.self, Idefics3.init)
+        creators["gemma3"] = create(Gemma3Configuration.self, Gemma3.init)
+        creators["gemma4"] = create(Gemma4VLMConfiguration.self, Gemma4VLMModel.init)
+        creators["smolvlm"] = create(SmolVLM2Configuration.self, SmolVLM2.init)
         // TODO: see if we can make it work with fastvlm rather than llava_qwen2
-        "fastvlm": create(FastVLMConfiguration.self, FastVLM.init),
-        "llava_qwen2": create(FastVLMConfiguration.self, FastVLM.init),
-        "pixtral": create(PixtralConfiguration.self, PixtralVLM.init),
-        "mistral3": create(Mistral3VLMConfiguration.self, Mistral3VLM.init),
-        "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
-        "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
-        "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
-    ])
+        creators["fastvlm"] = create(FastVLMConfiguration.self, FastVLM.init)
+        creators["llava_qwen2"] = create(FastVLMConfiguration.self, FastVLM.init)
+        creators["pixtral"] = create(PixtralConfiguration.self, PixtralVLM.init)
+        creators["mistral3"] = create(Mistral3VLMConfiguration.self, Mistral3VLM.init)
+        creators["lfm2_vl"] = create(LFM2VLConfiguration.self, LFM2VL.init)
+        creators["lfm2-vl"] = create(LFM2VLConfiguration.self, LFM2VL.init)
+        creators["glm_ocr"] = create(GlmOcrConfiguration.self, GlmOcr.init)
+        return .init(creators: creators)
+    }()
 }
 
 public enum VLMProcessorTypeRegistry {
 
     /// Shared instance with default processor types.
-    public static let shared: ProcessorTypeRegistry = .init(creators: [
-        "PaliGemmaProcessor": create(
-            PaliGemmaProcessorConfiguration.self, PaliGemmaProcessor.init),
-        "Qwen2VLProcessor": create(
-            Qwen2VLProcessorConfiguration.self, Qwen2VLProcessor.init),
-        "Qwen2_5_VLProcessor": create(
-            Qwen25VLProcessorConfiguration.self, Qwen25VLProcessor.init),
-        "Qwen3VLProcessor": create(
-            Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
-        "Idefics3Processor": create(
-            Idefics3ProcessorConfiguration.self, Idefics3Processor.init),
-        "Gemma3Processor": create(
-            Gemma3ProcessorConfiguration.self, Gemma3Processor.init),
-        "SmolVLMProcessor": create(
-            SmolVLMProcessorConfiguration.self, SmolVLMProcessor.init),
-        "FastVLMProcessor": create(
-            FastVLMProcessorConfiguration.self, FastVLMProcessor.init),
-        "PixtralProcessor": create(
-            PixtralProcessorConfiguration.self, PixtralProcessor.init),
-        "Mistral3Processor": create(
-            Mistral3VLMProcessorConfiguration.self, Mistral3VLMProcessor.init),
-        "Lfm2VlProcessor": create(
-            LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
-        "Glm46VProcessor": create(
-            GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
-    ])
+    /// 8 Apr 2026: builder pattern for the same type-checker reason as VLMTypeRegistry.
+    public static let shared: ProcessorTypeRegistry = {
+        var creators: [String: (Data, any Tokenizer) throws -> any UserInputProcessor] = [:]
+        creators["PaliGemmaProcessor"] = create(PaliGemmaProcessorConfiguration.self, PaliGemmaProcessor.init)
+        creators["Qwen2VLProcessor"] = create(Qwen2VLProcessorConfiguration.self, Qwen2VLProcessor.init)
+        creators["Qwen2_5_VLProcessor"] = create(Qwen25VLProcessorConfiguration.self, Qwen25VLProcessor.init)
+        creators["Qwen3VLProcessor"] = create(Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init)
+        creators["Idefics3Processor"] = create(Idefics3ProcessorConfiguration.self, Idefics3Processor.init)
+        creators["Gemma3Processor"] = create(Gemma3ProcessorConfiguration.self, Gemma3Processor.init)
+        creators["Gemma4Processor"] = create(Gemma4ProcessorConfiguration.self, Gemma4Processor.init)
+        creators["SmolVLMProcessor"] = create(SmolVLMProcessorConfiguration.self, SmolVLMProcessor.init)
+        creators["FastVLMProcessor"] = create(FastVLMProcessorConfiguration.self, FastVLMProcessor.init)
+        creators["PixtralProcessor"] = create(PixtralProcessorConfiguration.self, PixtralProcessor.init)
+        creators["Mistral3Processor"] = create(Mistral3VLMProcessorConfiguration.self, Mistral3VLMProcessor.init)
+        creators["Lfm2VlProcessor"] = create(LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init)
+        creators["Glm46VProcessor"] = create(GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init)
+        return .init(creators: creators)
+    }()
 }
 
 /// Registry of models and any overrides that go with them, e.g. prompt augmentation.
