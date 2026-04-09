@@ -270,14 +270,27 @@ class Gemma4Attention: Module {
         super.init()
     }
 
-    /// Returns (output, (keys, values), offset) — matching Python exactly
+    /// Attention forward. 9 Apr 2026 rewrite — aligned with Python mlx-vlm
+    /// `gemma4/language.py` Attention.__call__. Shared-KV layers read directly
+    /// from the persistent cache.state instead of relying on a transient
+    /// intermediates map; this is what lets multi-turn conversations retain
+    /// context correctly across ChatSession calls.
+    ///
+    /// Previous (buggy) implementation: every forward pass built a local
+    /// `intermediates: [(kv, offset)]` array and shared layers read from the
+    /// current-pass source layer's tuple. On Turn 2 the cache had the right
+    /// K/V for non-shared layers, but shared layers saw only the fresh K/V
+    /// freshly computed for the new tokens in the same pass — they NEVER saw
+    /// Turn 1's context. macOS Metal surfaced this as a Q2 hang (NaN/infinity
+    /// propagation in attention); iOS Metal silently tolerated the degenerate
+    /// state at the cost of late-layer quality. Both manifestations are now
+    /// fixed by making shared layers read cache.state, which is Turn-1-aware.
     func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache? = nil,
-        sharedKV: (MLXArray, MLXArray)? = nil,
-        offset: Int = 0
-    ) -> (MLXArray, (MLXArray, MLXArray), Int) {
+        isKVSharedLayer: Bool = false
+    ) -> MLXArray {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
         var queries = queryProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
@@ -285,16 +298,43 @@ class Gemma4Attention: Module {
 
         var keys: MLXArray
         var values: MLXArray
-        var effectiveOffset = offset
+        var effectiveOffset = 0
 
-        if let (sk, sv) = sharedKV {
-            keys = sk
-            values = sv
+        if isKVSharedLayer, let cache {
+            // Python: `state = cache.state; keys, values = state[0], state[1]`
+            // The source layer (earlier in the same forward pass) has already
+            // called `cache.update(k, v)` with the new token K/V, so cache.state
+            // holds the fully-merged [prior + new] tensors, roped correctly,
+            // in the same [B, nKV, totalL, headDim] layout we need here. We
+            // bypass k_proj/v_proj entirely (shared layers don't own those
+            // weights anyway — see init: valueProj is nil when useKEqV is true
+            // and the shared layers share the source's projection via the
+            // weight-tying in sanitize()).
+            let s = cache.state
+            if s.count >= 2 {
+                keys = s[0]
+                values = s[1]
+            } else {
+                // Defensive: cache not yet primed. Fall through to computing
+                // fresh K/V from this layer's input (will not match the source
+                // layer semantically, but avoids a crash; in practice this
+                // branch is unreachable because the source layer always runs
+                // before the shared layer in the same loop iteration).
+                keys = keyProj(x).reshaped(B, L, nKVHeads, effectiveHeadDim)
+                values = useKEqV ? keys : (valueProj?(x).reshaped(B, L, nKVHeads, effectiveHeadDim) ?? keys)
+                keys = keyNorm(keys).transposed(0, 2, 1, 3)
+                values = valueNorm(values).transposed(0, 2, 1, 3)
+                keys = rope(keys, offset: 0)
+            }
+            effectiveOffset = cache.offset
         } else {
+            // Non-shared layer: standard QKV projection + cache update.
+            if let cache {
+                effectiveOffset = cache.offset
+            }
+
             keys = keyProj(x).reshaped(B, L, nKVHeads, effectiveHeadDim)
             values = useKEqV ? keys : (valueProj?(x).reshaped(B, L, nKVHeads, effectiveHeadDim) ?? keys)
-
-            effectiveOffset = cache?.offset ?? 0
 
             keys = keyNorm(keys)
             keys = keys.transposed(0, 2, 1, 3)
@@ -302,16 +342,16 @@ class Gemma4Attention: Module {
 
             values = valueNorm(values)
             values = values.transposed(0, 2, 1, 3)
+
+            if let cache {
+                let (ck, cv) = cache.update(keys: keys, values: values)
+                keys = ck
+                values = cv
+            }
         }
 
         queries = queries.transposed(0, 2, 1, 3)
         queries = rope(queries, offset: effectiveOffset)
-
-        if let cache {
-            let (ck, cv) = cache.update(keys: keys, values: values)
-            keys = ck
-            values = cv
-        }
 
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale, mask: mask
@@ -319,7 +359,7 @@ class Gemma4Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return (outputProj(output), (keys, values), effectiveOffset)
+        return outputProj(output)
     }
 }
 
@@ -390,18 +430,21 @@ class Gemma4DecoderLayer: Module {
         super.init()
     }
 
-    /// Returns (h, shared_kv, offset) — matching Python exactly
+    /// 9 Apr 2026 rewrite — attention now returns only the hidden state; the
+    /// caller passes the correct cache (via layer_idx_to_cache_idx mapping)
+    /// and the `isKVSharedLayer` flag. The old (sharedKV, offset) return tuple
+    /// was a leftover from the transient-intermediates pattern that caused
+    /// multi-turn context loss on macOS Gemma 4.
     func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache? = nil,
         perLayerInput: MLXArray? = nil,
-        sharedKV: (MLXArray, MLXArray)? = nil,
-        offset: Int = 0
-    ) -> (MLXArray, (MLXArray, MLXArray)?, Int) {
+        isKVSharedLayer: Bool = false
+    ) -> MLXArray {
         var residual = x
         var h = inputLayerNorm(x)
-        let (attnOut, kvs, newOffset) = selfAttention(h, mask: mask, cache: cache, sharedKV: sharedKV, offset: offset)
+        let attnOut = selfAttention(h, mask: mask, cache: cache, isKVSharedLayer: isKVSharedLayer)
         h = postAttentionLayerNorm(attnOut)
         h = residual + h
 
@@ -437,7 +480,7 @@ class Gemma4DecoderLayer: Module {
         }
 
         h = h * layerScalar
-        return (h, kvs, newOffset)
+        return h
     }
 }
 
@@ -539,45 +582,74 @@ public class Gemma4Model: Module {
             }
         }
 
-        // Cache: pad with nil for shared layers
-        var layerCache: [KVCache?]
+        // 9 Apr 2026 — Gemma 4 shared KV multi-turn fix.
+        //
+        // Python reference (mlx-vlm gemma4/language.py Gemma4TextModel):
+        //   for i, layer in enumerate(self.layers):
+        //       c = cache[self.layer_idx_to_cache_idx[i]]
+        //       ...
+        //
+        // The incoming `cache` array has `firstKVSharedLayerIdx` entries (15
+        // for E2B, 18 for E4B), one per non-shared layer. For shared layers
+        // we use the SAME underlying KVCache object as their source layer —
+        // `previousKVs[i]` holds that mapping (0..14 for non-shared, and for
+        // shared layers, the index of the last non-shared layer of the same
+        // attention type). Reusing the KVCache object means:
+        //   1. The source layer updates the cache once per pass
+        //      (cache.update writes Turn-N's K/V onto the Turn-(N-1) state)
+        //   2. The shared layer reads cache.state to get the same merged
+        //      [Turn-1..Turn-N] K/V tensors — this is what preserves context
+        //      across ChatSession turns. The previous implementation used a
+        //      per-pass `intermediates` local that wiped shared-layer state
+        //      every forward call, so Turn-2+ shared layers only saw fresh
+        //      tokens and attention patterns collapsed (macOS: Q2 hang via
+        //      NaN propagation; iOS: silent quality degradation).
+        let types = config.resolvedLayerTypes()
+        let M = config.firstKVSharedLayerIdx
+
+        // Resolve each logical layer index → the KVCache object it should use.
+        // For non-shared layers this is cache[i]. For shared layers this is
+        // cache[previousKVs[i]] (which always points back into the 0..M-1 range).
+        var layerCaches: [KVCache?] = Array(repeating: nil, count: config.hiddenLayers)
         if let c = cache {
-            layerCache = c + Array(repeating: nil as KVCache?, count: config.hiddenLayers - c.count)
-        } else {
-            layerCache = Array(repeating: nil, count: config.hiddenLayers)
+            for i in 0 ..< config.hiddenLayers {
+                let cacheIdx = previousKVs[i]
+                if cacheIdx < c.count {
+                    layerCaches[i] = c[cacheIdx]
+                }
+            }
         }
 
-        // Masks
-        let types = config.resolvedLayerTypes()
+        // Masks — pick the first non-shared cache of each attention type so
+        // the mask sees a populated cache with correct offset (shared layers
+        // may come later in the loop but by then the mask has already been
+        // constructed from the source cache).
         var maskCache: [String: MLXFast.ScaledDotProductAttentionMaskMode] = [:]
         var masks: [MLXFast.ScaledDotProductAttentionMaskMode] = []
-        for (i, layer) in layers.enumerated() {
+        for (i, _) in layers.enumerated() {
             let lt = types[i]
             if maskCache[lt] == nil {
+                // `layerCaches[i]` is guaranteed non-nil here when a cache
+                // array was passed, since previousKVs resolves to a valid
+                // slot in the cache array.
                 if lt == "full_attention" {
-                    maskCache[lt] = createAttentionMask(h: h, cache: layerCache[i])
+                    maskCache[lt] = createAttentionMask(h: h, cache: layerCaches[i])
                 } else {
-                    maskCache[lt] = createAttentionMask(h: h, cache: layerCache[i], windowSize: config.slidingWindow)
+                    maskCache[lt] = createAttentionMask(h: h, cache: layerCaches[i], windowSize: config.slidingWindow)
                 }
             }
             masks.append(maskCache[lt]!)
         }
 
-        // Forward through layers with shared KV intermediates
-        var intermediates: [(kv: (MLXArray, MLXArray)?, offset: Int)] = Array(repeating: (nil, 0), count: config.hiddenLayers)
-
+        // Forward — each layer uses its resolved cache. Shared layers (idx >= M)
+        // read cache.state (Python pattern) rather than recomputing k_proj/v_proj.
         for (idx, layer) in layers.enumerated() {
-            let prevIdx = previousKVs[idx]
-            let sharedKV = intermediates[prevIdx].kv
-            let prevOffset = intermediates[prevIdx].offset
-
-            let (newH, kvs, newOffset) = layer(
-                h, mask: masks[idx], cache: layerCache[idx],
+            let isShared = (idx >= M) && (config.numKVSharedLayers > 0)
+            h = layer(
+                h, mask: masks[idx], cache: layerCaches[idx],
                 perLayerInput: pliList[idx],
-                sharedKV: sharedKV, offset: prevOffset
+                isKVSharedLayer: isShared
             )
-            h = newH
-            intermediates[idx] = (kvs, newOffset)
         }
 
         return norm(h)
