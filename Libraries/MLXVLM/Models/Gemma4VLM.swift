@@ -390,8 +390,13 @@ private class Gemma4VisionPatchEmbedder: Module {
         // position_embedding_table has shape [2, position_embedding_size, hidden_size].
         // For axis 0 (col) use patchPositions[..., 0]; for axis 1 (row) use patchPositions[..., 1].
         // Each is a gather; we sum both contributions onto the patch embeddings.
-        let colIdx = patchPositions[.ellipsis, 0]
-        let rowIdx = patchPositions[.ellipsis, 1]
+        //
+        // 10 Apr 2026: Defensive .int32 cast before gather. The caller builds
+        // patchPositions as Int32 (see Gemma4VisionModel.callAsFunction) but
+        // some MLX arithmetic ops promote to Float32 silently; subscript gather
+        // fatal-errors with "Got indices with invalid dtype" in that case.
+        let colIdx = patchPositions[.ellipsis, 0].asType(.int32)
+        let rowIdx = patchPositions[.ellipsis, 1].asType(.int32)
 
         let tableCol = positionEmbeddingTable[0]  // [position_embedding_size, hidden_size]
         let tableRow = positionEmbeddingTable[1]
@@ -607,18 +612,30 @@ private class Gemma4VisionModel: Module {
         let pW = W / patchSize
 
         // Build patch positions [B, pH*pW, 2]: position[i] = (col, row)
+        //
+        // 10 Apr 2026: Force .int32 after every MLX op to prevent dtype promotion
+        // to Float32. Subscript gather used later in Gemma4VisionPatchEmbedder
+        // (`tableCol[colIdx]`) requires integral indices, and MLX arithmetic ops
+        // like `%` and `/` can promote Int32 → Float32 on scalar broadcasts.
+        // Qwen3.5 VLM port hit the same issue (see Qwen35.swift: `.asType(.int32)`
+        // cast at lines 523, 973, 1078) and fixed it with explicit casts after
+        // each construction step. Matches the Python reference which uses
+        // `.astype(np.int32)` right before converting to `mx.array`.
         let numPatches = pH * pW
         let idx = MLXArray(Array(0 ..< numPatches).map { Int32($0) })
         let pwArr = Int32(pW)
         // Swift int-div via explicit cast; broadcast of scalars with MLX.
-        let colIdx = idx % MLXArray(pwArr)       // col (x)
-        let rowIdx = idx / MLXArray(pwArr)       // row (y)
+        // Re-cast to .int32 after each op — MLX may promote to Float32 silently.
+        let colIdx = (idx % MLXArray(pwArr)).asType(.int32)       // col (x)
+        let rowIdx = (idx / MLXArray(pwArr)).asType(.int32)       // row (y)
         // [numPatches, 2]  -> stack along axis -1
-        let pos2D = stacked([colIdx, rowIdx], axis: -1)  // [numPatches, 2]
+        let pos2D = stacked([colIdx, rowIdx], axis: -1).asType(.int32)  // [numPatches, 2]
         var patchPositions = expandedDimensions(pos2D, axis: 0)  // [1, numPatches, 2]
         if B > 1 {
             patchPositions = repeated(patchPositions, count: B, axis: 0)
         }
+        // Final guarantee the downstream gather sees integer indices
+        patchPositions = patchPositions.asType(.int32)
 
         var h = patchEmbedder(pixelValues, patchPositions: patchPositions)
         h = encoder(h, patchPositions: patchPositions)
@@ -706,11 +723,16 @@ public class Gemma4VLMModel: Module, VLMModel, KVCacheDimensionProvider {
         let flatImage = imageFeatures.flattened()
 
         // Compute positions where mask is True; scatter flatImage[0..k] into those positions.
+        // 10 Apr 2026: Aggressive .int32 cast after every op — MLX.cumsum and
+        // the subsequent % may promote to Float32 silently, which makes the
+        // downstream subscript gather fatal-error with "invalid dtype" (same
+        // root cause we hit in the patch position build above).
         let maskInts = flatMask.asType(.int32)
-        let cumsum = MLX.cumsum(maskInts, axis: 0) - 1
+        let cumsumRaw = (MLX.cumsum(maskInts, axis: 0) - 1).asType(.int32)
+        let modIndex = (cumsumRaw % MLXArray(Int32(flatImage.shape[0]))).asType(.int32)
         // Only valid for positions where mask is True. We gather from flatImage by cumsum index.
         // For positions where mask is False, we keep flatEmbeds value via MLX.where.
-        let gathered = flatImage[cumsum % flatImage.shape[0]]
+        let gathered = flatImage[modIndex]
         flatEmbeds = MLX.where(flatMask, gathered, flatEmbeds)
 
         return flatEmbeds.reshaped(shape)
