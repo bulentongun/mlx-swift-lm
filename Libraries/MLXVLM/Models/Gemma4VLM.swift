@@ -698,8 +698,12 @@ public class Gemma4VLMModel: Module, VLMModel, KVCacheDimensionProvider {
         inputIds: MLXArray,
         pixelValues: MLXArray?
     ) -> MLXArray {
-        // Main token embeddings from language model's embed layer
-        let mainEmbeds = languageModel.model.embedTokens(inputIds)
+        // Match upstream Gemma4 VLM: scale text embeddings here (for image-bearing
+        // prompts) and skip global re-scaling in Gemma4Text when inputEmbeddings
+        // are already fused.
+        let rawEmbeds = languageModel.model.embedTokens(inputIds)
+        let embedScale = MLXArray(pow(Float(config.textConfiguration.hiddenSize), 0.5), dtype: .float32)
+        let mainEmbeds = (rawEmbeds * embedScale).asType(rawEmbeds.dtype)
 
         guard let pixels = pixelValues else {
             return mainEmbeds
