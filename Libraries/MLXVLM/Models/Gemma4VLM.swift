@@ -711,8 +711,20 @@ public class Gemma4VLMModel: Module, VLMModel, KVCacheDimensionProvider {
         imageFeatures = imageFeatures.asType(mainEmbeds.dtype)
 
         // Scatter image features into positions where input_ids == image_token_id.
-        let imageTokenIdArray = MLXArray(Int32(config.effectiveImageTokenId))
-        let imageMask = MLX.equal(inputIds, imageTokenIdArray)  // [B, L] bool
+        // 2 May 2026 — dtype-safe imageMask. Previous `MLXArray(Int32(...))` +
+        // `MLX.equal()` combination produced silently False mask whenever
+        // `inputIds` had a different dtype (e.g. Int64 default from MLXArray([Int])
+        // initializer in Gemma4Processor.prepare promptTokens). When mask is all-
+        // False, image features never get injected into prompt embeddings, model
+        // sees text-only prompt → emits training-time placeholder hallucinations
+        // (PMI / icons / frameworks) instead of describing the photo.
+        // Fix matches upstream ml-explore/mlx-swift-lm Gemma4.swift PR #180 + #211
+        // and the Qwen35.swift mergeInputIdsWithImageFeatures pattern (both PASS).
+        let imageMask = (inputIds .== MLXArray(config.effectiveImageTokenId))  // [B, L] bool
+        #if DEBUG
+        let _gm4DbgMaskTrueCount = imageMask.asType(.int32).sum().item(Int.self)
+        debugPrint("🖼️ [GEMMA4-DBG] inputIds.dtype=\(inputIds.dtype) imageTokenId=\(config.effectiveImageTokenId) imageMask.sum()=\(_gm4DbgMaskTrueCount) pixelShape=\(pixels.shape)")
+        #endif
         var maskExpanded = expandedDimensions(imageMask, axis: -1)
         maskExpanded = MLX.broadcast(maskExpanded, to: mainEmbeds.shape)
 
