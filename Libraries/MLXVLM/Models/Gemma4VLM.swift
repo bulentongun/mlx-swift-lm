@@ -712,7 +712,8 @@ public class Gemma4VLMModel: Module, VLMModel, KVCacheDimensionProvider {
 
         #if DEBUG
         let _vMean = imageFeatures.mean().item(Float.self)
-        let _vStd = imageFeatures.std().item(Float.self)
+        let _vCentered = imageFeatures - imageFeatures.mean()
+        let _vStd = MLX.sqrt((_vCentered * _vCentered).mean()).item(Float.self)
         let _vAbsMax = MLX.abs(imageFeatures).max().item(Float.self)
         let _vAbsMin = MLX.abs(imageFeatures).min().item(Float.self)
         debugPrint("🔬 [GEMMA4-VTOWER] mean=\(_vMean) std=\(_vStd) absMax=\(_vAbsMax) absMin=\(_vAbsMin)")
