@@ -710,6 +710,14 @@ public class Gemma4VLMModel: Module, VLMModel, KVCacheDimensionProvider {
         imageFeatures = embedVision(imageFeatures)
         imageFeatures = imageFeatures.asType(mainEmbeds.dtype)
 
+        #if DEBUG
+        let _vMean = imageFeatures.mean().item(Float.self)
+        let _vStd = imageFeatures.std().item(Float.self)
+        let _vAbsMax = MLX.abs(imageFeatures).max().item(Float.self)
+        let _vAbsMin = MLX.abs(imageFeatures).min().item(Float.self)
+        debugPrint("🔬 [GEMMA4-VTOWER] mean=\(_vMean) std=\(_vStd) absMax=\(_vAbsMax) absMin=\(_vAbsMin)")
+        #endif
+
         // Scatter image features into positions where input_ids == image_token_id.
         //
         // 2 May 2026 — Replaced cumsum + modulo + MLX.where chain with the
