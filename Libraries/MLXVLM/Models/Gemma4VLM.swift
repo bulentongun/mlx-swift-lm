@@ -773,18 +773,46 @@ public class Gemma4VLMModel: Module, VLMModel, KVCacheDimensionProvider {
     /// Build per-layer-input (PLE) token IDs: image positions are mapped to pad token ID
     /// so PLE lookup returns a neutral signal (per HF blog guidance).
     private func buildPLETokenIds(_ inputIds: MLXArray) -> MLXArray {
-        let imageId = MLXArray(Int32(config.effectiveImageTokenId))
-        let padId = MLXArray(Int32(config.effectivePadTokenId))
-        let audioIdInt = Int32(config.audioTokenId ?? -1)
-        let videoIdInt = Int32(config.videoTokenId ?? -1)
+        // 2 May 2026 — Same dtype-mismatch root cause as the scatter mask
+        // fix at line 728 (32d851d commit). The previous
+        //   MLX.where(MLX.equal(inputIds, MLXArray(Int32(...))), padId, inputIds)
+        // pattern produced a silently all-False mask when inputIds was Int64
+        // (default dtype of MLXArray([Int]) initializer in
+        // Gemma4Processor.prepare). With all-False mask, this function was
+        // a no-op: pleIds = inputIds unchanged, so image_token_id stayed at
+        // image positions. getPerLayerInputs(pleIds) then looked up garbage
+        // PLE for image_token (no meaningful entry in PLE table), and
+        // projectPerLayerInputs added that garbage to every transformer
+        // layer's image positions, overwhelming the correct image features
+        // injected by getInputEmbeddings.
+        //
+        // Visible symptom: model hallucinated training-time placeholder
+        // descriptions (PMI/icons/frameworks/sandbox, then "political
+        // spectrum" after the scatter rewrite) even though the post-scatter
+        // DEBUG log confirmed 266 features × 1536 hidden = 408576 scalars
+        // were correctly injected at consecutive prompt positions 16-281.
+        //
+        // Fix matches line 728: use the .== operator (which respects
+        // MLXArray dtype broadcasting) instead of MLX.equal() with explicit
+        // Int32 wrap. Added DEBUG log to verify image_token count drops to
+        // 0 and pad_token count rises by ~266 after the rewrite.
+        let imageTokenId = config.effectiveImageTokenId
+        let padTokenId = config.effectivePadTokenId
+        let padArr = MLXArray(Int32(padTokenId))
 
-        var ids = MLX.where(MLX.equal(inputIds, imageId), padId, inputIds)
-        if audioIdInt >= 0 {
-            ids = MLX.where(MLX.equal(ids, MLXArray(audioIdInt)), padId, ids)
+        var ids = MLX.where(inputIds .== MLXArray(imageTokenId), padArr, inputIds)
+        if let audioId = config.audioTokenId {
+            ids = MLX.where(ids .== MLXArray(audioId), padArr, ids)
         }
-        if videoIdInt >= 0 {
-            ids = MLX.where(MLX.equal(ids, MLXArray(videoIdInt)), padId, ids)
+        if let videoId = config.videoTokenId {
+            ids = MLX.where(ids .== MLXArray(videoId), padArr, ids)
         }
+
+        #if DEBUG
+        let _imgRemain = (ids .== MLXArray(imageTokenId)).asType(.int32).sum().item(Int.self)
+        let _padCount = (ids .== padArr).asType(.int32).sum().item(Int.self)
+        debugPrint("🧩 [GEMMA4-PLE] After buildPLETokenIds: imageToken remaining=\(_imgRemain) (expected 0) padToken count=\(_padCount) (expected ≥266)")
+        #endif
         return ids
     }
 
