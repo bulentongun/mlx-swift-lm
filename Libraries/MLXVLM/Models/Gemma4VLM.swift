@@ -711,43 +711,63 @@ public class Gemma4VLMModel: Module, VLMModel, KVCacheDimensionProvider {
         imageFeatures = imageFeatures.asType(mainEmbeds.dtype)
 
         // Scatter image features into positions where input_ids == image_token_id.
-        // 2 May 2026 — dtype-safe imageMask. Previous `MLXArray(Int32(...))` +
-        // `MLX.equal()` combination produced silently False mask whenever
-        // `inputIds` had a different dtype (e.g. Int64 default from MLXArray([Int])
-        // initializer in Gemma4Processor.prepare promptTokens). When mask is all-
-        // False, image features never get injected into prompt embeddings, model
-        // sees text-only prompt → emits training-time placeholder hallucinations
-        // (PMI / icons / frameworks) instead of describing the photo.
-        // Fix matches upstream ml-explore/mlx-swift-lm Gemma4.swift PR #180 + #211
-        // and the Qwen35.swift mergeInputIdsWithImageFeatures pattern (both PASS).
+        //
+        // 2 May 2026 — Replaced cumsum + modulo + MLX.where chain with the
+        // Qwen35.mergeInputIdsWithImageFeatures pattern (CPU-side nonZero
+        // enumeration → GPU subscript-assign). Same codebase, device-PASS for
+        // all Qwen3.5 unified models. The prior cumsum approach was math-
+        // equivalent on paper but the 4-op MLX chain (cumsum → subtract 1 →
+        // modulo → gather → where) had a latent corner case that produced
+        // placeholder hallucinations on iPhone 15 PM + 17 PM with Gemma 4 E2B
+        // (model emitted PMI / icons / frameworks instead of describing the
+        // photo even though imageMask.sum() = 266 confirmed image tokens did
+        // reach the prompt). The nonZero+subscript pattern bypasses the chain.
+        //
+        // Defensive guard: count mismatch → skip scatter + DEBUG log loudly.
+        // Better to hallucinate visibly than crash silently or corrupt embeds.
         let imageMask = (inputIds .== MLXArray(config.effectiveImageTokenId))  // [B, L] bool
         #if DEBUG
         let _gm4DbgMaskTrueCount = imageMask.asType(.int32).sum().item(Int.self)
-        debugPrint("🖼️ [GEMMA4-DBG] inputIds.dtype=\(inputIds.dtype) imageTokenId=\(config.effectiveImageTokenId) imageMask.sum()=\(_gm4DbgMaskTrueCount) pixelShape=\(pixels.shape)")
+        debugPrint("🖼️ [GEMMA4-DBG] inputIds.dtype=\(inputIds.dtype) imageTokenId=\(config.effectiveImageTokenId) imageMask.sum()=\(_gm4DbgMaskTrueCount) pixelShape=\(pixels.shape) imageFeatShape=\(imageFeatures.shape)")
         #endif
         var maskExpanded = expandedDimensions(imageMask, axis: -1)
         maskExpanded = MLX.broadcast(maskExpanded, to: mainEmbeds.shape)
 
-        // Flatten both and do a bool-mask scatter.
-        let shape = mainEmbeds.shape
-        let flatMask = maskExpanded.flattened()
-        var flatEmbeds = mainEmbeds.flattened()
-        let flatImage = imageFeatures.flattened()
+        let originalShape = mainEmbeds.shape
+        let flattenedEmbeds = mainEmbeds.flattened()
+        let flattenedFeatures = imageFeatures.flattened()
+        let flattenedMask = maskExpanded.flattened()
 
-        // Compute positions where mask is True; scatter flatImage[0..k] into those positions.
-        // 10 Apr 2026: Aggressive .int32 cast after every op — MLX.cumsum and
-        // the subsequent % may promote to Float32 silently, which makes the
-        // downstream subscript gather fatal-error with "invalid dtype" (same
-        // root cause we hit in the patch position build above).
-        let maskInts = flatMask.asType(.int32)
-        let cumsumRaw = (MLX.cumsum(maskInts, axis: 0) - 1).asType(.int32)
-        let modIndex = (cumsumRaw % MLXArray(Int32(flatImage.shape[0]))).asType(.int32)
-        // Only valid for positions where mask is True. We gather from flatImage by cumsum index.
-        // For positions where mask is False, we keep flatEmbeds value via MLX.where.
-        let gathered = flatImage[modIndex]
-        flatEmbeds = MLX.where(flatMask, gathered, flatEmbeds)
+        // Defensive count check — image-mask scalars must equal feature scalars.
+        let nMaskTrue = flattenedMask.asType(.int32).sum().item(Int.self)
+        let nFeatures = flattenedFeatures.size
+        guard nMaskTrue == nFeatures else {
+            #if DEBUG
+            debugPrint("🚨 [GEMMA4-SCATTER] count mismatch — maskTrue=\(nMaskTrue) features=\(nFeatures); SKIPPING scatter (model will hallucinate)")
+            #endif
+            return mainEmbeds
+        }
 
-        return flatEmbeds.reshaped(shape)
+        // CPU-side enumeration of True indices in the flattened mask.
+        let maskBoolArray = flattenedMask.asType(.bool).asArray(Bool.self)
+        var indices: [Int] = []
+        indices.reserveCapacity(nFeatures)
+        for (idx, v) in maskBoolArray.enumerated() where v {
+            indices.append(idx)
+        }
+
+        // GPU subscript-assign scatter (Qwen35.swift line 1078-1079 pattern).
+        var result = flattenedEmbeds
+        if !indices.isEmpty && indices.count == flattenedFeatures.size {
+            let indexArray = MLXArray(indices.map { UInt32($0) })
+            result[indexArray] = flattenedFeatures
+        }
+
+        #if DEBUG
+        debugPrint("✅ [GEMMA4-SCATTER] injected \(nFeatures) feature scalars at \(indices.count) positions; firstIdx=\(indices.first ?? -1) lastIdx=\(indices.last ?? -1)")
+        #endif
+
+        return result.reshaped(originalShape)
     }
 
     /// Build per-layer-input (PLE) token IDs: image positions are mapped to pad token ID
