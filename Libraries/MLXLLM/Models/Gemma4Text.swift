@@ -569,8 +569,14 @@ public class Gemma4Model: Module {
         perLayerInputs: MLXArray? = nil
     ) -> MLXArray {
         var h: MLXArray
-        if let ie = inputEmbeddings { h = ie } else { h = embedTokens(inputs) }
-        h = h * embedScale
+        if let ie = inputEmbeddings {
+            // Match upstream Gemma4 behavior: pre-fused embeddings (text+vision)
+            // are already in model space and must not be re-scaled.
+            h = ie
+        } else {
+            h = embedTokens(inputs)
+            h = h * embedScale
+        }
 
         // PLE
         var pliList: [MLXArray?] = Array(repeating: nil, count: config.hiddenLayers)
